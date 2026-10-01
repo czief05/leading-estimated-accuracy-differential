@@ -1,0 +1,501 @@
+---
+title: "LEAD (Leading Estimated Accuracy Differential)"
+output: html_document
+---
+### Executive Report
+NFL quarterbacks are often evaluated using statistics like yards per game and passer rating, and throwing accuracy is almost solely measured by completion percentage. Unfortunately, these statistics are heavily influenced by play design, defensive coverage, and receiver performance. Teams lack a straightforward way to measure how accurately a quarterback places the ball relative to the receiver’s route path, or how well they lead receivers with their throw. Our project aims to answer this question with the Leading Estimated Accuracy Differential (LEAD) metric, which measures how close each pass is to the receiver’s expected path at the moment of the throw.
+
+We used NFL Next Gen Stats tracking data from the 2023 season, which records player positions ten times per second from snap to catch. To get meaningful estimates, we kept only plays in which the receiver was clearly headed toward the eventual catch point. Plays where the receiver was still turning, slowing, or changing direction do not give a fair picture of where the quarterback was trying to place the ball, so we also removed plays where the ball landed far from the receiver, since these are often not actual accuracy attempts. Using the receiver’s speed and direction just before the pass, we estimated where a perfectly led throw should have landed and compared that spot to the ball’s actual landing point. The LEAD score for each play is the yardage difference between this ideal landing point and the true one.
+
+After calculating LEAD for every qualifying play, we computed the average LEAD for all quarterbacks in the 2023 season. Jared Goff, Joshua Dobbs, and Russell Wilson led the league with the lowest average LEAD scores, offering new insight into quarterback performance that may contrast with more traditional statistics. When focusing specifically on deeper passes (over 15 yards), elite throwers such as Patrick Mahomes, Trevor Lawrence, and C.J. Stroud rose to the top, highlighting how deeper routes demand far more precise ball placement, suggesting that short passes may lower some quarterbacks’ overall LEAD scores. Looking at individual plays provided even more insight into the importance of ball placement. For well-covered routes, a low-LEAD throw may be the only catchable ball. On the other hand, a pass with a high LEAD might be caught. However, the placement prevented the receiver from gaining additional separation, staying in stride, or maximizing play potential, leaving yards and potentially points on the table. These examples show how important throwing with low LEAD is for offensive efficiency and preventing missed opportunities.
+
+LEAD provides insight into ball placement that traditional stats cannot, because it is independent of whether the receiver makes the catch. It helps identify quarterbacks who consistently “throw receivers open” by anticipating where the receiver will be. Coaches can use LEAD to evaluate timing, route chemistry, and placement precision on deeper throws. Fans and broadcasters can use LEAD as an intuitive, visual way to understand passing accuracy, offering a more objective picture of pure quarterback ball-placement skill.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+libraries <- c("tidyverse", "dplyr", "DescTools", "ggplot2" , "gganimate", "patchwork")
+
+for (pkg in libraries) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+### Load Data
+To begin the analysis, we loaded the supplementary play-level data along with all pre-throw (input) and post-throw (output) tracking data for the 2023 NFL season. The supplementary file provides game and play context, such as play descriptions, routes, targeting information, and pass outcomes.
+
+The input data contains the full-resolution player-tracking information before the throw. This includes each player’s x and y coordinates on the field for every frame, recorded at 10 frames per second (one frame every 0.1 seconds). These files provide player positions, roles, route information, and descriptive metadata for each play.
+
+The output data contains similar coordinate information, but only after the quarterback releases the ball. While the output files include fewer variables than the input files, they still allow us to track receiver movement during the ball’s flight.
+
+Because the NFL distributes this data in weekly files, we looped through all available weeks for both input and output data and concatenated each set into a complete full-season dataset. This ensures that every play and every frame from Weeks 1-18 is included in our analysis.
+```{r}
+supplementary = read.csv("supplementary_data.csv")
+
+input_weeks_1 <- read.csv("input_2023_w01.csv")
+for (i in 2:9) {
+  input = read.csv(paste0("input_2023_w0", i, ".csv"))
+  input_weeks_1 <- input_weeks_1 %>% bind_rows(input)
+}
+
+input_weeks_2 <- read.csv("input_2023_w10.csv")
+for (i in 1:8) {
+  input = read.csv(paste0("input_2023_w1", i, ".csv"))
+  input_weeks_2 <- input_weeks_2 %>% bind_rows(input)
+}
+
+output_weeks_1 <- read.csv("output_2023_w01.csv")
+for (i in 2:9) {
+  output = read.csv(paste0("output_2023_w0", i, ".csv"))
+  output_weeks_1 <- output_weeks_1 %>% bind_rows(output)
+}
+
+output_weeks_2 <- read.csv("output_2023_w10.csv")
+for (i in 1:8) {
+  output = read.csv(paste0("output_2023_w1", i, ".csv"))
+  output_weeks_2 <- output_weeks_2 %>% bind_rows(output)
+}
+
+input_all <- input_weeks_1 %>% bind_rows(input_weeks_2)
+output_all <- output_weeks_1 %>% bind_rows(output_weeks_2)
+```
+
+
+### Data Preparation
+To prepare our data for analysis, we started by joining the supplementary data to the input data based on `game_id` and `play_id`, then filtered for specific play outcomes and routes that could require leading the ball during receiver motion.
+```{r}
+all_data <- input_all %>% left_join(supplementary, by = c("game_id", "play_id")) %>% 
+  filter(pass_result %in% c("C", "I", "IN")) %>%
+  filter(route_of_targeted_receiver %in% c("IN", "POST", "OUT", "CORNER", "CROSS", "FLAT", "GO", "SLANT", "ANGLE", "WHEEL")) 
+```
+
+Since we are only interested in data for the targeted receiver and the quarterback who threw the ball, we started by creating a table that displays the quarterback for every play where the quarterback actually passed the ball. This allowed us to remove all plays where someone other than the quarterback was the passer, and only include frames for the targeted receiver with a column for which quarterback threw it to them.
+```{r}
+qb_lookup <- input_all %>%
+  filter(player_role == "Passer", player_position == "QB") %>% 
+  select(game_id, play_id, player_name) %>% 
+  distinct() %>%
+  group_by(game_id, play_id) %>%
+  ungroup() %>%
+  rename(QB = player_name)
+
+all_data <- all_data %>% 
+  left_join(qb_lookup, by = c("game_id", "play_id")) %>% 
+  filter(!is.na(QB)) %>%  
+  filter(player_role == "Targeted Receiver") %>% 
+  select(game_id, play_id, nfl_id, play_description, frame_id, QB,
+    player_name, player_role, x, y, dir, s,
+    ball_land_x, ball_land_y, num_frames_output, pass_length, expected_points_added, pass_result) 
+```
+
+Next, we sliced out the final frames of every play and added new columns for the final coordinates of the targeted receiver so that we could remove any plays where the ball landed over five yards from the receiver, assuming that in those circumstances something went wrong, like the receiver got injured, the quarterback threw the ball away, etc. 
+```{r}
+final_positions <- output_all %>% 
+  group_by(game_id, play_id) %>% 
+  slice_tail(n = 1) %>% 
+  ungroup %>% 
+  rename(player_final_x = x, player_final_y = y) %>% 
+  select(game_id, play_id, nfl_id, player_final_x, player_final_y)
+
+all_data <- all_data %>% left_join(final_positions, by = c("game_id", "play_id", "nfl_id")) %>% 
+  mutate(distance = sqrt((ball_land_x - player_final_x)^2 + (ball_land_y - player_final_y)^2)) %>% 
+  filter(distance < 5)
+```
+
+Finally, we calculated the maximum speed that each receiver reached during each route before the throw, and removed all throws where the receiver was moving at less than 75% of that max speed. This was done to remove all plays where the receiver was either breaking down, making a move, or for some other reason was moving slowly at the last frame before the throw, because we will use this speed to calculate a perfect ball landing location, and if they are moving slower than expected at that last frame, the estimate will be very short. 
+```{r}
+all_data <- all_data %>% 
+  group_by(game_id, play_id) %>% 
+  mutate(max_speed = max(s)) %>% 
+  slice_tail(n = 1) %>% 
+  filter(s > max_speed*0.75) %>% 
+  ungroup()
+```
+
+
+### Compute if receiver is facing the ball pre-throw
+To determine whether a receiver was actually moving toward the final ball location at the moment before the throw, we compare two angles: the angle from the receiver to the ball’s landing point, and the receiver’s own facing direction. We compute the receiver-to-ball angle using `atan2`, which returns the direction of that vector in standard mathematical coordinates: $θball=atan2(yball−y,xball−x)$.
+The receiver’s facing direction `dir` uses the NFL convention where 0° points upfield and angles increase clockwise, so we convert it into the same coordinate system as `atan2` using: $θrecv=(90−dir)*180/π$, which ensures that both angles are measured on the same scale and can be meaningfully compared. We then measure the angular difference between the two directions, wrap it to the interval $(-\pi, \pi]$ to handle circularity, and check whether the absolute difference falls within a small tolerance (10°). If the ball’s landing point lies inside this directional “triangle", we treat the receiver as facing the ball and keep the play; otherwise the play is removed. This filtering step ensures that we only estimate ideal ball placement for plays where the receiver had already begun breaking and moving toward the throw location, preventing distorted predictions from frames where the receiver was still cutting, slowing down, or changing direction.
+```{r}
+deg2rad <- function(d) d * pi / 180
+
+check_facing <- function(x, y, ball_land_x, ball_land_y, dir_deg, thresh_deg = 10) {
+  vec_angle <- atan2(ball_land_y - y, ball_land_x - x)
+  recv_angle <- deg2rad(90-dir_deg)
+  delta <- vec_angle - recv_angle
+  delta_wrapped <- atan2(sin(delta), cos(delta))
+  abs(delta_wrapped) <= deg2rad(thresh_deg)
+}
+
+facing_ball_data <- all_data %>% 
+  mutate(is_facing_ball = check_facing(x, y, ball_land_x, ball_land_y, dir)) %>%
+  filter(is_facing_ball == TRUE)
+```
+```{r, echo = FALSE}
+play_pre <- input_all %>%
+  filter(game_id == 2023091004, play_id == 2312) %>%
+  filter(player_role == "Targeted Receiver") %>% 
+  mutate(phase = "pre_throw")
+
+thresh_deg <- 10
+L <- 50
+
+cone <- play_pre %>% 
+  slice_tail(n = 1) %>%
+  mutate(
+    dir_rad_math = (90 - dir) * pi / 180,        
+    thresh_rad   = thresh_deg * pi / 180,
+    x_apex = x,
+    y_apex = y,
+    x_left  = x + L * cos(dir_rad_math - thresh_rad),
+    y_left  = y + L * sin(dir_rad_math - thresh_rad),
+    x_right = x + L * cos(dir_rad_math + thresh_rad),
+    y_right = y + L * sin(dir_rad_math + thresh_rad)
+  )
+
+triangle_df <- tibble(
+  x = c(cone$x_apex, cone$x_left, cone$x_right),
+  y = c(cone$y_apex, cone$y_left, cone$y_right),
+  order = c(1, 2, 3)
+)
+
+bad <- ggplot() +
+  geom_point(data = play_pre, aes(x = x, y = y),color = "black", alpha = 0.6, size = 1.5) +
+  geom_vline(xintercept = 10) +
+  theme_void() +
+  geom_vline(xintercept = play_pre %>% 
+               pull(absolute_yardline_number), color = "blue", linewidth = 1.25, alpha = 0.65) + 
+  theme(panel.background = element_rect(fill = "grey90", color = "black")) +
+  geom_polygon(
+    data = triangle_df,
+    aes(x = x, y = y),
+    fill = "yellow", alpha = 0.2, color = "yellow") +
+  geom_point(aes(x = 64.29, y = 30), color = "brown") +
+  coord_fixed(xlim = c(35, 100), ylim = c(0, 53.3)) +
+  geom_vline(xintercept = 40, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 50, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 60, color = "white", alpha = 0.5) + 
+  geom_vline(xintercept = 70, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 80, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 90, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 100, color = "white", alpha = 0.5) +
+  ggtitle("Example of Ball Throw Before Break")
+```
+```{r, echo = FALSE}
+play_pre <- input_all %>%
+  filter(game_id == 2023092501, play_id == 2910) %>%
+  filter(player_role == "Targeted Receiver") %>% 
+  mutate(phase = "pre_throw")
+
+
+cone <- play_pre %>% 
+  slice_tail(n = 1) %>%
+  mutate(
+    dir_rad_math = (90 - dir) * pi / 180,       
+    thresh_rad   = thresh_deg * pi / 180,
+    x_apex = x,
+    y_apex = y,
+    x_left  = x + L * cos(dir_rad_math - thresh_rad),
+    y_left  = y + L * sin(dir_rad_math - thresh_rad),
+    x_right = x + L * cos(dir_rad_math + thresh_rad),
+    y_right = y + L * sin(dir_rad_math + thresh_rad)
+  )
+
+triangle_df <- tibble(
+  x = c(cone$x_apex, cone$x_left, cone$x_right),
+  y = c(cone$y_apex, cone$y_left, cone$y_right),
+  order = c(1, 2, 3)
+)
+
+good <- ggplot() +
+  geom_point(
+    data = play_pre,
+    aes(x = x, y = y),
+    color = "black",
+    alpha = 0.6,
+    size = 1.5) +
+  geom_vline(xintercept = 10) +
+  theme_void() +
+  geom_vline(xintercept = play_pre %>% 
+               pull(absolute_yardline_number), color = "blue", linewidth = 1.25, alpha = 0.65) + 
+  theme(panel.background = element_rect(fill = "grey90", color = "black")) +
+  geom_polygon(
+    data = triangle_df,
+    aes(x = x, y = y),
+    fill = "yellow", alpha = 0.2, color = "yellow") +
+  geom_point(aes(x = play_pre[1,] %>% pull(ball_land_x), 
+                 y = play_pre[1,] %>% pull(ball_land_y)), 
+             color = "brown") +
+  coord_fixed(xlim = c(35, 100), ylim = c(0, 53.3)) +
+  geom_vline(xintercept = 40, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 50, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 60, color = "white", alpha = 0.5) + 
+  geom_vline(xintercept = 70, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 80, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 90, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 100, color = "white", alpha = 0.5) +
+  ggtitle("Example of Ball Thrown After Break")
+```
+```{r, echo= FALSE}
+(bad | plot_spacer() | good) + plot_layout(widths = c(1, 0.1, 1))
+```
+
+The visuals above show how we used a directional “triangle” to determine whether the receiver was moving toward the eventual ball landing spot at the final frame before the throw:
+
+Left Picture:
+
+ * The ball’s landing point (brown dot) falls outside the receiver’s directional triangle (yellow).
+This means the receiver had not yet begun breaking toward the throw location. Plays like this produce unrealistic “perfect throw” estimates because the receiver is still running a different route segment and not yet running in the direction of the final ball landing spot.
+
+Right Picture:
+
+ * The ball’s landing point falls inside the receiver’s triangle. This indicates the receiver was already moving in the general direction of the eventual catch point at the moment of release. These plays are kept, and we can use the receiver’s speed and direction to estimate the QB’s ideal ball placement.
+ 
+This filter ensures that our accuracy metric only evaluates plays where the receiver’s pre-throw movement meaningfully reflects the intended route direction, allowing for a cleaner isolation of QB ball placement.
+
+
+### Calulate Leading Estimated Accuracy Differential (LEAD) in Yards
+The LEAD calculation is the core of our analysis. Once we confirmed that the receiver was facing the ball and moving at a realistic speed, we estimated where a perfectly led pass should have landed.
+
+We used the receiver’s speed (s) and direction (dir) at the last pre-throw frame to compute their velocity in the x and y directions. With tracking data recorded at 10 frames per second, we then multiplied the velocity by the number of frames the ball spent in the air to estimate where the receiver would be at the moment the ball arrived if the quarterback placed the throw exactly in stride.
+
+This estimated landing point is what we call the perfect lead location. The actual ball landing spot is pulled from the tracking data. The yard distance between these two points is the LEAD value for that throw. A smaller LEAD value indicates that the quarterback placed the ball very close to where the receiver should have ended up based on their pre-throw movement. A larger LEAD value means the receiver had to adjust more significantly to make the catch, or that the ball simply didn’t go where it should have.
+```{r}
+LEAD_frame <- facing_ball_data %>% 
+  mutate(dir_rad = dir * pi / 180) %>% 
+  mutate(vx = s*sin(dir_rad), 
+         vy = s*cos(dir_rad)) %>% 
+  mutate(x_perfect = x + vx*(num_frames_output + 1)/10,
+         y_perfect = y + vy*(num_frames_output + 1)/10) %>% 
+  mutate(throw_difference = sqrt(((ball_land_x - x_perfect)^2 + (ball_land_y - y_perfect)^2)))
+```
+
+
+### Top QB's by Average LEAD
+After calculating the LEAD for every pass in our filtered dataset, we summarized these numbers by quarterback. For each QB, we calculated the average difference between where the ball actually landed and where it should have landed based on the receiver’s movement. We set a threshold of 35 throws in order to remove very low average LEADs calculated from very few throws, and chose 35 because that was the lowest number of throws by a quarterback who played in over half of the games in the 2023 season. This summary displays our LEAD metric and shows which quarterbacks most consistently put the ball where the receiver was expected to be. 
+```{r}
+LEAD_frame %>% group_by(QB) %>% 
+  summarise(Avg_LEAD = mean(throw_difference), num_throws = n()) %>% 
+  arrange(Avg_LEAD) %>% 
+  filter(num_throws > 35) %>% 
+  head(10)
+```
+As shown above, Jared Goff had the lowest Average LEAD of 1.46 yards, followed by Joshua Dobbs and Russell Wilson. This provides new insight to quarterback performance, showing that some quarterbacks like Joshua Dobbs, who may have had a poor performing season, were still throwing accurate and well-lead balls. Average LEAD provides a very interesting and new understanding of quarterback's throwing accuracy in a way that completion percentage cannot, since it is not dependent on the receiver catching the ball, but only how well the receiver was lead down their path. 
+```{r}
+LEAD_frame %>% filter(pass_length > 15) %>% 
+  group_by(QB) %>% summarise(Avg_LEAD = mean(throw_difference), num_throws = n()) %>% 
+  arrange(Avg_LEAD) %>% 
+  filter(num_throws > 10) %>% 
+  head(10)
+```
+Additionally, we calculated the top 10 quarterbacks with the lowest average LEAD in yards, but only for throws that are over 15 yards. The lowest average LEAD for these throws is 2.36 yards from Patrick Mahomes, which is much farther than even the 10th best average LEAD for all throws, showing how LEAD favors these easier and shorter passes. This confirms that it is significantly easier to lead a receiver who is running a five yard slant than a receiver who is moving 30 yards down the field, and the top 10 rankings for average LEAD on deeper balls contains quarterbacks considered more talented like the aforementioned Patrick Mahomes, C.J Stroud, Justin Herbert, and more, showing that these rankings may be a more apt description of a quarterbacks talent and accuracy. 
+
+Moving away from season average LEAD, inspecting the LEAD on individual throws reveals key information about how accurate a throw was versus how well a receiver adjusted to the ball, and how play outcomes could have changed if the LEAD was lower or higher. 
+
+# Russell Wilson Deep Ball With a 0.2 Yard LEAD
+```{r, echo = FALSE}
+player_lookup <- input_all %>% 
+  select(nfl_id, player_name) %>% 
+  distinct()
+
+play_pre <- input_all %>%
+  filter(game_id == 2023091711, play_id == 1082) %>%
+  mutate(phase = "pre_throw")
+
+play_post <- output_all %>%
+  filter(game_id == 2023091711, play_id == 1082) %>% 
+  mutate(phase = "post_throw")
+
+Russ <- bind_rows(play_pre, play_post) %>%
+  left_join(player_lookup, by = "nfl_id") %>% 
+  left_join(LEAD_frame %>% select(game_id, play_id, x_perfect, y_perfect), 
+            by = c("game_id", "play_id")) %>%
+  mutate(frame_global = if_else(phase == "pre_throw",frame_id,
+                                play_pre %>% 
+                                  filter(player_role == "Targeted Receiver") %>% 
+                                  slice_tail(n = 1) %>% pull(frame_id) + frame_id)) %>% 
+  rename(Player = player_name.y)
+
+ggplot() +
+  geom_point(data = Russ %>% filter(phase == "pre_throw"),
+             aes(x = x, y = y), color = "black",alpha = 0.6, size = 1.5) +
+  
+  geom_point(data = Russ %>% filter(phase == "post_throw"),
+             aes(x = x, y = y, color = Player), size = 2) +
+  
+   geom_point(aes(x = Russ[1,] %>% pull(ball_land_x), y = Russ[1,] %>% pull(ball_land_y)), 
+              color = "brown", alpha = 0.8) +
+  geom_point(aes(x = Russ[1,] %>% pull(x_perfect), y = Russ[1,] %>% pull(y_perfect)), 
+             color = "gold", alpha = 0.8) +
+  
+  geom_vline(xintercept = 20, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 30, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 40, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 50, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 60, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 70, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 80, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 10, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = Russ[1,] %>% pull(absolute_yardline_number), 
+             color = "blue", linewidth = 1.25, alpha = 0.65) +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "grey90", colour = "darkgreen")) +
+  transition_time(frame_global) +
+  ease_aes("linear") +
+  coord_fixed(xlim = c(10, 80), ylim = c(0, 53.3))
+```
+
+In this animation, we visualized a deep pass from Russell Wilson to Marvin Mims. The black points represent offensive and defensive players moving before the throw, and afterward, we see Mims and the defender, Emmanuel Forbes, moving toward the ball after it is released. The gold point represents our estimated perfect ball placement, and the brown point represents the true ball landing location. These points are overlapping, being only 0.2 yards apart, showing how accurately Russell Wilson threw the ball, leading Marvin Mims almost perfectly on his path. This is an example of a very accurate pass with a very low LEAD yardage, and it would have been a very difficult catch to make if thrown any shorter due to how close the defender was to Mims throughout his whole route. Wilson placed it perfectly, though, and Mims was even able to gain a few yards after the catch, and could have continued into the endzone if he had not accidentally stepped out of bounds. If this ball was thrown with a higher LEAD, it is unlikely it would have been caught and maybe could have been intercepted, showing how valuable a low LEAD throw is for gaining yards and scoring on offense. 
+
+### Jake Browning Deep Ball With a 5.12 Yard LEAD
+```{r, echo=FALSE}
+play_pre <- input_all %>%
+  filter(game_id == 2023121003, play_id == 2493) %>%
+  mutate(phase = "pre_throw")
+
+play_post <- output_all %>%
+  filter(game_id == 2023121003, play_id == 2493) %>% 
+  mutate(phase = "post_throw")
+
+Jake <- bind_rows(play_pre, play_post) %>%
+  left_join(player_lookup, by = "nfl_id") %>% 
+  left_join(LEAD_frame %>% select(game_id, play_id, x_perfect, y_perfect), 
+            by = c("game_id", "play_id")) %>%
+  mutate(frame_global = if_else(phase == "pre_throw",frame_id,
+      play_pre %>% filter(player_role == "Targeted Receiver") %>% 
+        slice_tail(n = 1) %>% 
+        pull(frame_id) + frame_id)) %>% 
+  rename(Player = player_name.y)
+
+ggplot() +
+  geom_point(data = Jake %>% filter(phase == "pre_throw"),
+             aes(x = x, y = y), color = "black", alpha = 0.6, size = 1.5) +
+  
+  geom_point(data = Jake %>% filter(phase == "post_throw"),
+             aes(x = x, y = y, color = Player), size = 2) +
+
+  geom_point(aes(x = 79.06424, y = 46.70866), color = "gold") +
+  geom_point(aes(x = 77.78, y = 51.67), color = "brown") +
+  geom_vline(xintercept = Jake[1,] %>% pull(absolute_yardline_number), 
+             color = "blue", linewidth = 1.25, alpha = 0.65) + 
+  geom_vline(xintercept = 30, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 40, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 50, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 60, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 70, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 80, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 90, color = "white", alpha = 0.5) +
+  
+  theme_void() +
+  theme(panel.background = element_rect(fill = "grey90", colour = "darkgreen")) +
+  transition_time(frame_global) +
+  ease_aes("linear") +
+  coord_fixed(xlim = c(25, 90), ylim = c(0, 53.3)) 
+```
+
+In this example, Jake Browning throws a deep fade to Tee Higgens who had beat Darrell Baker down the sideline and was wide open for a reception. As shown, though, Jake Browning placed the ball short and left of our estimated perfect ball location, with a very poor 5.12 Yard LEAD. Tee Higgens had to slow down, adjust his path, and even turn around to catch the ball, resulting in Baker Jr. catching up to him and tackling him shortly after the catch. If Jake Browning had lead Higgens down his path more accurately, he would have been able to easily catch the ball on the run and likely score a touchdown. While this play looked like a successful deep ball completion on Jake Browning's stat line, it was actually a throw with very high LEAD that potentially left points on the table for the Bengals. This displays how important throwing with low LEAD is for creating yards after catch and a more efficient offensive. 
+
+```{r, echo = FALSE, warning=FALSE}
+receiver_pre <- input_all %>%
+  filter(game_id == 2023121003, play_id == 2493, player_role == "Targeted Receiver") %>%
+  mutate(phase = "pre_throw",
+         frame_global = frame_id) %>%
+  select(game_id, play_id, nfl_id, frame_global, x, y, phase)
+
+receiver_post <- output_all %>%
+  filter(game_id == 2023121003, play_id == 2493, nfl_id == unique(receiver_pre$nfl_id)) %>%
+  mutate(phase = "post_throw",
+         frame_global = 31 + frame_id) %>%   # 31 because that's where pre-throw frames ends
+  select(game_id, play_id, nfl_id, frame_global, x, y, phase)
+
+receiver_all <- bind_rows(receiver_pre, receiver_post) %>%
+  arrange(frame_global)
+
+frame3 <- receiver_post %>% filter(frame_global == 31+3)
+frame8 <- receiver_post %>% filter(frame_global == 31+8)
+
+vx <- (frame8$x - frame3$x) / 5
+vy <- (frame8$y - frame3$y) / 5
+
+n_steps <- max(receiver_post$frame_global)
+
+perfect_path <- tibble(
+  x = frame8$x + vx * seq(0, n_steps, length.out = 50),
+  y = frame8$y + vy * seq(0, n_steps, length.out = 50)
+)
+
+first_pred <- perfect_path %>% slice(1)
+
+connector <- tibble(
+   x = c(first_pred$x, 79.06424),
+   y = c(first_pred$y, 46.70866)
+)
+
+actual_land <- tibble(
+  x = 77.78,
+  y = 51.67)
+
+predicted_land <- tibble(
+  x = 79.06424,
+  y = 46.70866)
+
+ggplot() +
+  geom_path(
+    data = receiver_all,
+    aes(x = x, y = y),
+    color = "black",
+    linewidth = 1.7
+  ) +
+  geom_path(
+  data = connector,
+  aes(x = x, y = y),
+  color = "gold",
+  linetype = "dashed",
+  linewidth = 1.3
+) +
+  geom_point(
+    data = actual_land,
+    aes(x = x, y = y),
+    color = "brown",
+    size = 3.5
+  ) +
+  geom_point(
+    data = predicted_land,
+    aes(x = x, y = y),
+    color = "gold",
+    size = 3.5
+  ) +
+  geom_vline(xintercept = Jake[1,] %>% pull(absolute_yardline_number), 
+             color = "blue", linewidth = 1.25, alpha = 0.65) +
+  geom_vline(xintercept = 30, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 40, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 50, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 60, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 70, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 80, color = "white", alpha = 0.5) +
+  geom_vline(xintercept = 90, color = "white", alpha = 0.5) +
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "grey90", colour = "darkgreen"),
+    legend.position = "top"
+  ) +
+  coord_fixed(xlim = c(25, 90), ylim = c(0, 53.3)) +
+  ggtitle("Jake Browning Deep Pass to Tee Higgins\nActual WR Path vs Predicted Path")
+```
+
+Here is a still shot of the same play where Jake Browning targets Tee Higgins. The black line shows Higgins’ actual route, with the brown dot marking where the pass ultimately landed, and in this case, he made the catch. On the play, though, Browning’s throw forces Higgins to slow down and turn his body back to the ball.
+
+The gold dashed line represents our predicted “perfect” path, and the gold dot shows the ideal ball placement. Based on the model, if Browning had thrown to that spot, Higgins likely would have caught the ball in stride, picked up more yards after the catch, and possibly scored a touchdown.
+
+
+### Conclusion
+Overall, our analysis provides a clearer picture of how accurately NFL quarterbacks are leading their receivers on throws. By using NFL tracking data, we estimated where a perfectly-placed ball should land based on the receiver’s speed and direction, and comparing that spot to the ball’s actual landing point, we created a metric (LEAD) that reflects the ball-leading accuracy. The results show noticeable differences between quarterbacks, with some consistently delivering the ball closer to the receiver’s expected path than others. Along with ranking quarterbacks, LEAD provides insights to throws that are otherwise more difficult to see on a stat line. A completed pass may seem like a successful feat for a quarterback, but if the LEAD was very high, it is possible that more yards and potentially points were left on the table, than if the receiver was led in-stride on their route. On the other hand, a low LEAD score for a throw asserts that it was not only a successful pass, but also a very accurate ball that could have potentially led to an incompletion or interception if thrown differently.  The play animations, such as the examples from Russell Wilson and Jake Browning, help reinforce this by showing how each throw aligns with the receiver’s movement in real time.
+
+That said, the metric comes with limitations. It does not capture every piece of context, such as defensive pressure, route adjustments, tight coverage, intentional under throws, or other situational decisions, and it is not meant to declare which quarterback is the most accurate overall. Instead, it measures how far each throw deviates from what a “perfectly led” pass would look like based purely on movement and timing. It can also be a great tool for viewers: we can show the example of what a perfectly lead ball  would have looked like compared to where the ball actually landed, and how, if thrown with lower LEAD, more yards after catch and EPA could have been created. This just adds a more interactive element for fans. Even with these limitations, the approach still offers a more detailed way to evaluate ball placement and accuracy compared to traditional stats like completion percentage or passing yards.
+
+
+
+
